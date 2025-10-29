@@ -1,0 +1,12 @@
+{
+  "app": {
+    "title": "Cửa hàng React"
+  },
+  "nav": {
+    "home": "Trang chủ",
+    "dashboard": "Bảng điều khiển",
+    "products": "Sản phẩm",
+    "users": "Người dùng"
+  }
+}
+

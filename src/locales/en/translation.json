@@ -1,0 +1,12 @@
+{
+  "app": {
+    "title": "React Shop"
+  },
+  "nav": {
+    "home": "Home",
+    "dashboard": "Dashboard",
+    "products": "Products",
+    "users": "Users"
+  }
+}
+

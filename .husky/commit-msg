@@ -1,0 +1,11 @@
+# #!/usr/bin/env sh
+# . "$(dirname -- "$0")/_/husky.sh"
+#
+# # Simple commit message length check (commented out by default)
+# msgfile=$1
+# msg=$(cat "$msgfile")
+# if [ ${#msg} -lt 10 ]; then
+#   echo "Commit message too short (min 10 chars)" >&2
+#   exit 1
+# fi
+
