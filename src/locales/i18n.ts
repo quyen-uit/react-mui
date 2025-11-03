@@ -13,7 +13,14 @@ i18n.use(initReactI18next).init({
   },
   lng: saved || 'en',
   fallbackLng: 'en',
-  interpolation: { escapeValue: false },
+  interpolation: {
+    escapeValue: true, // Escape values to prevent XSS attacks
+  },
+  defaultNS: 'translation',
+  ns: ['translation'],
+  react: {
+    useSuspense: false,
+  },
 });
 
 export function setLanguage(lang: 'en' | 'vi') {

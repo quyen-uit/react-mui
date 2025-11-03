@@ -3,6 +3,7 @@ import react from '@vitejs/plugin-react';
 import tsconfigPaths from 'vite-tsconfig-paths';
 import { createHtmlPlugin } from 'vite-plugin-html';
 import { sentryVitePlugin } from '@sentry/vite-plugin';
+import path from 'path';
 
 const cspDirectives = [
   "default-src 'self'",
@@ -34,6 +35,11 @@ export default defineConfig(({ mode }) => {
           telemetry: false,
         }),
     ].filter(Boolean) as any,
+    resolve: {
+      alias: {
+        '@': path.resolve(__dirname, './src'),
+      },
+    },
     server: {
       port: 3000,
       headers: {
@@ -47,18 +53,20 @@ export default defineConfig(({ mode }) => {
       },
     },
     build: {
+      chunkSizeWarningLimit: 1000,
       rollupOptions: {
         output: {
-          manualChunks(id) {
-            if (id.includes('react') || id.includes('react-dom') || id.includes('react-router')) {
-              return 'vendor';
-            }
-            if (id.includes('@reduxjs/toolkit') || id.includes('react-redux')) {
-              return 'redux';
-            }
-            if (id.includes('@mui') || id.includes('@emotion')) {
-              return 'mui';
-            }
+          manualChunks: {
+            'react-vendor': ['react', 'react-dom'],
+            'router': ['react-router-dom'],
+            'redux': ['@reduxjs/toolkit', 'react-redux'],
+            'mui-core': ['@mui/material', '@emotion/react', '@emotion/styled'],
+            'mui-icons': ['@mui/icons-material'],
+            'mui-pickers': ['@mui/x-date-pickers', '@mui/system'],
+            'table': ['material-react-table'],
+            'i18n': ['i18next', 'react-i18next'],
+            'toast': ['react-toastify'],
+            'forms': ['react-hook-form', '@hookform/resolvers', 'zod'],
           },
         },
       },

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-A production-ready React application with TypeScript, featuring authentication, role-based access control, admin dashboard, internationalization, and comprehensive state management using Redux Toolkit with RTK Query.
+A production-ready React application with TypeScript, featuring authentication, role-based access control, admin dashboard, internationalization, and comprehensive state management using Redux Toolkit with RTK Query. Built with Material-UI (MUI) v6, Tailwind CSS, and includes MSW for API mocking during development.
 
 ## Essential Commands
 
@@ -34,7 +34,19 @@ npm run format           # Format code with Prettier
 ### Git Hooks
 Pre-commit hooks via Husky automatically run ESLint and Prettier on staged files.
 
+### Docker
+```bash
+docker build -t react-shop .     # Build Docker image
+docker run -p 8080:80 react-shop  # Run container on port 8080
+```
+
 ## Architecture
+
+### MSW (Mock Service Worker)
+- Enable/disable with `VITE_ENABLE_MSW=true` in `.env` (development only)
+- Default handlers: `/auth/me` returns 401, `/health` returns ok
+- Handlers defined in `src/mocks/` directory
+- MSW runs in browser via service worker when enabled
 
 ### State Management Strategy
 - **Redux Store** (`src/app/store.ts`): Combines `authSlice` reducer and RTK Query `baseApi` reducer
@@ -56,7 +68,7 @@ Pre-commit hooks via Husky automatically run ESLint and Prettier on staged files
 
 ### Routing Architecture
 - **Main Layout** (`/`): Public pages + protected user routes
-- **Admin Layout** (`/admin`): Nested under ProtectedRoute with `allowedRoles={['admin']}`
+- **Admin Layout** (`/admin`): Nested under ProtectedRoute with `roles={['admin']}`
 - **ProtectedRoute Component**: Checks `auth.isAuthenticated` from Redux, redirects to `/login` if not authenticated, optionally validates roles
 
 ### Path Aliases
@@ -72,87 +84,266 @@ Features are self-contained in `src/features/[feature-name]/`:
 - Exported via `index.ts` barrel file
 - Co-located tests (e.g., `ProfilePage.test.tsx`)
 
-### API Service Pattern
-Each API domain lives in `src/services/api/[domain]/`:
-- `[domain]Api.ts`: Defines endpoints using `baseApi.injectEndpoints()`
-- `index.ts`: Re-exports API slice and auto-generated hooks
-- Tag-based cache invalidation (e.g., `['Products']`, `['Auth']`, `['User']`)
+### Custom Hooks (`src/hooks/`)
+Reusable business logic extracted into custom hooks:
 
-Example:
+- **`useAuth`** - Authentication utilities (user, logout, hasRole, hasPermission)
+- **`usePagination`** - Client-side pagination with next/prev/goToPage
+- **`useApiMutation`** - Mutation wrapper with loading states and toast notifications
+- **`useDebounce`** - Debounced values for search/filtering (500ms default)
+- **`useLocalStorage`** - Persistent state with localStorage sync
+- **`useActivityTimeout`** - Auto-logout after inactivity (default 30 minutes)
+
+Example usage:
 ```typescript
+import { useAuth, usePagination, useDebounce } from '@/hooks';
+
+const { user, logout, hasRole } = useAuth();
+const { paginatedData, nextPage, prevPage } = usePagination({ data, itemsPerPage: 10 });
+const debouncedSearch = useDebounce(searchTerm, 500);
+```
+
+### API Service Pattern
+Each API domain is a file in `src/services/api/`:
+- `[domain].ts`: Defines endpoints using `baseApi.injectEndpoints()`
+- Exports API slice and auto-generated hooks directly
+- **Pagination support** via `PaginationParams` (page, perPage, sortBy, sortOrder, search)
+- **Optimistic updates** for instant UI feedback
+- **Smart cache invalidation** with individual item tags
+
+Example from `src/services/api/products.ts`:
+```typescript
+import type { ApiListResponse, PaginationParams } from '@/types/api';
+
 export const productsApi = baseApi.injectEndpoints({
   endpoints: (builder) => ({
-    getProducts: builder.query({ providesTags: ['Products'] }),
-    createProduct: builder.mutation({ invalidatesTags: ['Products'] }),
+    listProducts: builder.query<ApiListResponse<Product>, PaginationParams | void>({
+      query: (params) => ({
+        url: PRODUCTS.LIST,
+        params: params || { page: 1, perPage: 10 },
+      }),
+      providesTags: (result) =>
+        result?.data
+          ? [
+              ...result.data.map(({ id }) => ({ type: 'Products' as const, id })),
+              { type: 'Products', id: 'LIST' },
+            ]
+          : [{ type: 'Products', id: 'LIST' }],
+    }),
+
+    updateProduct: builder.mutation<Product, Partial<Product> & { id: string | number }>({
+      query: ({ id, ...body }) => ({ url: PRODUCTS.UPDATE(id), method: 'PUT', body }),
+      invalidatesTags: (result, error, { id }) => [
+        { type: 'Products', id },
+        { type: 'Products', id: 'LIST' },
+      ],
+      // Optimistic update
+      async onQueryStarted({ id, ...patch }, { dispatch, queryFulfilled }) {
+        const patchResult = dispatch(
+          productsApi.util.updateQueryData('getProduct', id, (draft) => {
+            Object.assign(draft, patch);
+          })
+        );
+        try {
+          await queryFulfilled;
+        } catch {
+          patchResult.undo();
+        }
+      },
+    }),
   }),
 });
+
+export const { useListProductsQuery, useUpdateProductMutation } = productsApi;
 ```
 
 ### HTTP Client
-- **RTK Query**: Single client for CRUD and auth flows. Uses a `baseQueryWithReauth` wrapper for refresh and `retry` for transient failures.
+- **RTK Query**: Single client for CRUD and auth flows
+- **Type-safe baseQuery**: No `any` types, proper `ApiError` interface
+- **Auto token refresh** on 401 with request queuing (concurrent 401s deduplicated)
+- **Network error handling**: Detects and reports connection issues
+- **CSRF protection**: Automatically includes X-CSRF-Token header from meta tag
 
 ### Token Storage Strategy
 - Access token: kept only in memory (Redux). Never written to localStorage.
 - Refresh token: httpOnly, Secure cookie managed by the backend.
-- CSRF: currently not enforced by backend; no `X-CSRF-Token` header is sent. If enabled later, add the header for non-GET requests.
+- CSRF: Token read from `<meta name="csrf-token">` and sent with non-GET requests
 
-### Error Handling
-- **ErrorBoundary**: Wraps app in `src/main.tsx`, integrates with Sentry
-- **RTK Query Wrapper**: Centralized error handling and refresh in `src/services/baseApi.ts`
-- **RTK Query**: Errors accessible in hook results (e.g., `{ error, isError }`)
+### Error Handling System
+**Centralized error types** (`src/types/errors.ts`):
+```typescript
+export enum ErrorType {
+  NETWORK = 'NETWORK_ERROR',
+  AUTH = 'AUTH_ERROR',
+  VALIDATION = 'VALIDATION_ERROR',
+  SERVER = 'SERVER_ERROR',
+  NOT_FOUND = 'NOT_FOUND',
+  UNKNOWN = 'UNKNOWN_ERROR',
+}
+
+export class AppError extends Error {
+  static fromApiError(error: ApiError): AppError {
+    // Categorizes API errors into user-friendly types
+  }
+}
+```
+
+**Error UI Components**:
+- **`<ErrorAlert />`** (`src/components/errors/ErrorAlert.tsx`) - Displays errors with retry button
+- **`<ErrorBoundary />`** - Enhanced with stack traces in development mode
+- **Toast notifications** - Automatic error toasts via react-toastify
+
+**Usage in components**:
+```typescript
+import { ErrorAlert } from '@/components/errors';
+import { AppError } from '@/types/errors';
+
+const { data, error, refetch } = useListProductsQuery();
+
+if (error) {
+  return <ErrorAlert error={AppError.fromApiError(error)} onRetry={refetch} />;
+}
+```
 
 ### Internationalization
 - **i18next**: Configured in `src/locales/i18n.ts`
 - Languages: `en`, `vi` with translations in `src/locales/[lang]/translation.json`
 - Usage: `useTranslation()` hook from `react-i18next`
+- **Security**: `escapeValue: true` to prevent XSS attacks via translations
+
+### Toast Notifications
+- **react-toastify** integrated in `src/main.tsx`
+- Auto-dismiss after 3 seconds
+- Position: top-right
+- Themed with MUI colors
+
+**Usage**:
+```typescript
+import { toast } from 'react-toastify';
+
+toast.success('Product created successfully!');
+toast.error('Failed to save changes');
+toast.warning('Session expiring soon');
+```
 
 ### Component Organization
-Components moved to categorized subdirectories:
-- `src/components/ui/`: LoadingSpinner, Skeletons, Card (CSS Module example)
-- `src/components/guards/`: ProtectedRoute
-- `src/components/errors/`: ErrorBoundary
-Each component has its own folder with component file, tests, and index.ts
+Components organized by purpose:
+
+**`src/components/ui/`** - Reusable UI components:
+- `LoadingSpinner` - Generic loading indicator
+- `Skeletons` - Content placeholders
+- `SkeletonTable` - Table loading state (rows, columns configurable)
+- `SkeletonCard` - Card loading state (with/without image)
+- `Card` - Example with CSS Module
+
+**`src/components/forms/`** - Form components with react-hook-form:
+- `FormTextField` - Text input with automatic error display
+- `FormSelect` - Dropdown with options support
+
+**`src/components/guards/`**:
+- `ProtectedRoute` - Route protection with role checking
+
+**`src/components/errors/`**:
+- `ErrorBoundary` - Catches React errors, shows stack trace in dev
+- `ErrorAlert` - Displays API errors with retry button
+
+### Feature Flags (`src/config/features.ts`)
+Environment-based feature toggles:
+```typescript
+export const FEATURES = {
+  ENABLE_DARK_MODE: import.meta.env.VITE_FEATURE_DARK_MODE === 'true',
+  ENABLE_ANALYTICS: import.meta.env.VITE_FEATURE_ANALYTICS === 'true',
+  ENABLE_WEBSOCKETS: import.meta.env.VITE_FEATURE_WEBSOCKETS === 'true',
+  ENABLE_NOTIFICATIONS: import.meta.env.VITE_FEATURE_NOTIFICATIONS !== 'false',
+  ENABLE_BETA_FEATURES: import.meta.env.VITE_FEATURE_BETA === 'true',
+};
+
+// Usage
+{FEATURES.ENABLE_DARK_MODE && <DarkModeToggle />}
+```
+
+### Analytics (`src/utils/analytics.ts`)
+Event tracking system with pre-built trackers:
+```typescript
+import { analytics } from '@/utils/analytics';
+
+// Auth events
+analytics.login('email');
+analytics.logout();
+
+// Product events
+analytics.productView(productId);
+analytics.productCreate(productId);
+
+// Custom events
+analytics.custom('button_click', { button: 'submit', page: 'checkout' });
+```
 
 ### Styling Strategy
-This project uses **Mantine UI v7** with **CSS Modules** as the recommended styling approach.
+This project uses **Material-UI (MUI) v6** with **Tailwind CSS** utilities and **CSS Modules** for custom styles.
 
 #### Styling Priority (Use in this order):
-1. **Mantine Props** (First Choice) - For standard Mantine features
-2. **CSS Modules** (Second Choice) - For custom component styles
-3. **Inline Styles** (Last Resort) - For dynamic/conditional values only
+1. **MUI `sx` Prop & Theme** (First Choice) - For standard MUI styling
+2. **Tailwind Utilities** (Second Choice) - For quick layout/spacing helpers
+3. **CSS Modules** (Third Choice) - For complex custom component styles
+4. **Inline Styles** (Last Resort) - For dynamic/conditional values only
 
-#### 1. Mantine Props - Use FIRST ⭐
+#### 1. MUI `sx` Prop & Theme - Use FIRST ⭐
 **When to use:**
 - Standard spacing, colors, typography
-- Responsive design
-- Mantine's built-in design tokens
+- Responsive design with MUI breakpoints
+- Theme-based styling
 
 **Examples:**
 ```tsx
-// ✅ Good - Use Mantine props
-<Paper p="md" shadow="sm" radius="md" withBorder>
-  <Text size="lg" fw={600} c="blue">Title</Text>
-  <Button mt="md" variant="filled">Submit</Button>
+// ✅ Good - Use MUI sx prop
+import { Paper, Typography, Button } from '@mui/material';
+
+<Paper sx={{ p: 2, mb: 2, boxShadow: 1 }}>
+  <Typography variant="h6" color="primary" sx={{ fontWeight: 600 }}>
+    Title
+  </Typography>
+  <Button variant="contained" sx={{ mt: 2 }}>Submit</Button>
 </Paper>
 
-// Responsive
-<Grid.Col span={{ base: 12, sm: 6, md: 4 }}>
+// Responsive with breakpoints
+<Box sx={{
+  width: { xs: '100%', sm: '50%', md: '33%' },
+  p: { xs: 1, sm: 2, md: 3 }
+}}>
 
-// Common props
-p="md"          // padding
-mt="xl"         // margin-top
-c="blue"        // color
-fw={600}        // font-weight
-ta="center"     // text-align
+// Common sx properties
+sx={{ p: 2 }}           // padding: theme.spacing(2)
+sx={{ mt: 3 }}          // margin-top: theme.spacing(3)
+sx={{ color: 'primary.main' }}  // theme color
+sx={{ fontWeight: 600 }}
+sx={{ textAlign: 'center' }}
 ```
 
-#### 2. CSS Modules - Use for CUSTOM STYLES 🎨
+#### 2. Tailwind Utilities - Use for LAYOUT HELPERS 🎯
 **When to use:**
-- Custom layouts and positioning
+- Quick flex/grid layouts
+- Spacing adjustments
+- Common utility classes
+
+**Examples:**
+```tsx
+// ✅ Good - Tailwind for layout
+<div className="flex justify-between items-center gap-4">
+  <div className="flex-1">Content</div>
+  <div className="w-32">Sidebar</div>
+</div>
+
+// Grid layout
+<div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+```
+
+#### 3. CSS Modules - Use for CUSTOM STYLES 🎨
+**When to use:**
 - Complex hover effects and animations
 - Pseudo-elements (::before, ::after)
-- Component-specific styling
-- Media queries beyond Mantine's breakpoints
+- Component-specific custom styling
+- Styles that don't fit MUI or Tailwind patterns
 
 **File naming:** `ComponentName.module.css`
 
@@ -169,42 +360,30 @@ src/features/profile/
 
 **Usage pattern:**
 ```tsx
-// ProfileCard.tsx
-import { Paper, Text } from '@mantine/core';
-import classes from './ProfileCard.module.css';
+// Card.tsx
+import { Card as MuiCard, CardContent, Typography } from '@mui/material';
+import styles from './Card.module.css';
 
-export const ProfileCard = () => {
+export const Card = ({ title, children }) => {
   return (
-    <Paper className={classes.card} p="md">
-      <div className={classes.header}>
-        <Text className={classes.title}>Profile</Text>
-      </div>
-    </Paper>
+    <MuiCard className={styles.card} sx={{ mb: 2 }}>
+      <CardContent>
+        <Typography variant="h6">{title}</Typography>
+        {children}
+      </CardContent>
+    </MuiCard>
   );
 };
 ```
 
 ```css
-/* ProfileCard.module.css */
+/* Card.module.css */
 .card {
-  transition: transform 0.2s ease;
+  transition: box-shadow 0.2s ease-in-out;
 }
 
 .card:hover {
-  transform: translateY(-4px);
-}
-
-.header {
-  display: flex;
-  justify-content: space-between;
-  border-bottom: 2px solid var(--mantine-color-gray-3);
-}
-
-.title {
-  background: linear-gradient(45deg, var(--mantine-color-blue-6), var(--mantine-color-cyan-6));
-  background-clip: text;
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
+  box-shadow: 0 10px 20px rgba(0, 0, 0, 0.08);
 }
 
 /* Animations */
@@ -213,54 +392,22 @@ export const ProfileCard = () => {
   to { opacity: 1; }
 }
 
-.card {
+.fadeIn {
   animation: fadeIn 0.3s ease;
 }
 ```
 
-**Combining CSS Modules with Mantine:**
+**Combining all three approaches:**
 ```tsx
-// ✅ Best practice - Combine both
-<Paper className={classes.card} p="md" shadow="sm">
-  <Text className={classes.title} size="lg" fw={600}>
+// ✅ Best practice - Combine MUI sx, Tailwind, and CSS Modules
+<Paper className={`${styles.card} flex justify-between`} sx={{ p: 2, mb: 2 }}>
+  <Typography variant="h6" sx={{ fontWeight: 600 }}>
     Title
-  </Text>
+  </Typography>
 </Paper>
 ```
 
-**Using Mantine's classNames prop:**
-```tsx
-// For more control over Mantine component internals
-<Button
-  classNames={{
-    root: classes.buttonRoot,
-    label: classes.buttonLabel,
-    section: classes.buttonIcon,
-  }}
->
-  Click me
-</Button>
-```
-
-**Access Mantine CSS Variables:**
-```css
-.myClass {
-  color: var(--mantine-color-blue-6);
-  background: var(--mantine-color-gray-0);
-  border-radius: var(--mantine-radius-md);
-  padding: var(--mantine-spacing-md);
-  font-family: var(--mantine-font-family);
-}
-
-/* Responsive breakpoints */
-@media (min-width: $mantine-breakpoint-sm) {
-  .myClass {
-    padding: var(--mantine-spacing-xl);
-  }
-}
-```
-
-#### 3. Inline Styles - Use SPARINGLY ⚠️
+#### 4. Inline Styles - Use SPARINGLY ⚠️
 **When to use:**
 - Dynamic values from props/state
 - One-off exceptions
@@ -273,7 +420,7 @@ export const ProfileCard = () => {
 // ✅ Good - One-off override
 <Avatar style={{ cursor: 'pointer' }} />
 
-// ❌ Avoid - Should use CSS Module
+// ❌ Avoid - Should use sx prop or CSS Module
 <div style={{
   display: 'flex',
   padding: '20px',
@@ -285,55 +432,91 @@ export const ProfileCard = () => {
 
 | Scenario | Use |
 |----------|-----|
-| Spacing (padding, margin) | **Mantine props** (`p="md"`, `mt="xl"`) |
-| Colors from theme | **Mantine props** (`c="blue"`) |
-| Typography | **Mantine props** (`size="lg"`, `fw={600}`) |
-| Custom layouts (grid, flex) | **CSS Modules** |
-| Animations | **CSS Modules** |
+| Spacing (padding, margin) | **MUI sx** (`sx={{ p: 2, mt: 3 }}`) |
+| Colors from theme | **MUI sx** (`sx={{ color: 'primary.main' }}`) |
+| Typography | **MUI Typography** component with variant |
+| Quick flex/grid layouts | **Tailwind** (`flex justify-between`) |
+| Responsive design | **MUI sx breakpoints** (`sx={{ width: { xs: '100%', md: '50%' } }}`) |
+| Complex animations | **CSS Modules** |
 | Hover effects | **CSS Modules** |
 | Pseudo-elements | **CSS Modules** |
 | Dynamic colors/sizes from state | **Inline styles** |
-| One-off overrides | **Inline styles** |
 
 #### Setup
 - TypeScript types for CSS Modules: `src/types/css-modules.d.ts`
-- Example component: `src/components/ui/Card/` (demonstrates all patterns)
-- Vite handles CSS Modules automatically (no additional config needed)
-- PostCSS configured with `postcss-preset-mantine` for Mantine-specific transformations
+- Example component: `src/components/ui/Card.tsx` (demonstrates MUI + CSS Modules)
+- Tailwind configured in `tailwind.config.js`
+- Vite handles CSS Modules automatically
 
 ### Layouts
-- **MainLayout** (`src/layouts/MainLayout/`): Header with auth controls, Sidebar for navigation, uses `<Outlet />` for nested routes
-- **AdminLayout** (`src/layouts/AdminLayout.tsx`): Admin-specific shell with different navigation
+**MainLayout** (`src/layouts/MainLayout.tsx`):
+- Header with auth controls (logout button, user display)
+- Role-based navigation filtering
+- Dynamic sidebar with user info and role badge
+- Activity timeout integration (30-minute auto-logout)
+- Theme toggle (dark/light mode)
+- Language switcher (EN/VI)
+- Proper loading fallback with `CircularProgress`
+
+**AdminLayout** (`src/layouts/AdminLayout.tsx`):
+- Admin-specific shell with different navigation
+- Protected by ProtectedRoute with `roles={['admin']}`
 
 ### Security Features
-- Security headers in `vite.config.ts` (CSP, X-Frame-Options, etc.)
+**CSRF Protection**:
+- `baseApi` reads CSRF token from `<meta name="csrf-token">`
+- Token automatically sent with non-GET requests via `X-CSRF-Token` header
+
+**XSS Protection**:
+- i18n configured with `escapeValue: true`
+- All user input properly escaped in translations
+
+**Session Security**:
+- **Activity timeout**: Auto-logout after 30 minutes of inactivity
+- Tracks mouse, keyboard, scroll, touch events
+- Toast warning before logout
+- Access tokens stored only in memory (Redux), never in localStorage
+- Refresh tokens in httpOnly Secure cookies
+
+**Token Management**:
 - Automatic token refresh with request queuing
-- Request timeout/retry behavior handled via RTK Query `retry` with `API_CONFIG.RETRY_ATTEMPTS`
-- Cookies are sent via `credentials: 'include'`; prefer strict CSP in production
+- Concurrent 401s deduplicated (single refresh request)
+- Failed refresh triggers immediate logout
+
+**Headers**:
+- Security headers in `vite.config.ts` (CSP, X-Frame-Options, X-Content-Type-Options, etc.)
+- Cookies sent via `credentials: 'include'` in all API requests
 
 ### Performance Optimizations
-- Code splitting: vendor, redux, mantine chunks (`vite.config.ts` manualChunks)
-- RTK Query caching: 60s keepUnusedDataFor, 30s refetchOnMountOrArgChange
-- Lazy loading via React Router
+- **Code splitting**: vendor, redux, mui chunks (`vite.config.ts` manualChunks)
+- **RTK Query caching**:
+  - `keepUnusedDataFor: 60` seconds
+  - `refetchOnMountOrArgChange: 30` seconds
+  - Smart tag-based invalidation (individual item tags + list tags)
+- **Optimistic updates**: Instant UI feedback for mutations with automatic rollback on error
+- **Lazy loading**: React Router with Suspense for all routes
+- **Loading skeletons**: Content-aware placeholders instead of spinners
 
 ## Common Development Tasks
 
 ### Adding a New API Endpoint
-1. Create/update API slice in `src/services/api/[domain]/[domain]Api.ts`
+1. Create/update API slice in `src/services/api/[domain].ts`
 2. Define types in `src/types/[domain].ts`
-3. Use auto-generated hooks (e.g., `useGetProductsQuery`) in components
+3. Add URL constants in `src/constants/api.ts`
+4. Export auto-generated hooks from the API file
+5. Use hooks in components (e.g., `useListProductsQuery`, `useCreateProductMutation`)
 
 ### Adding a New Protected Route
 ```typescript
 // In src/routes/index.tsx
-{
-  path: 'new-page',
-  element: (
-    <ProtectedRoute allowedRoles={['user', 'admin']}> // optional
+<Route
+  path="/new-page"
+  element={
+    <ProtectedRoute roles={['admin']}> {/* roles prop is optional */}
       <NewPage />
     </ProtectedRoute>
-  ),
-}
+  }
+/>
 ```
 
 ### Adding Translations
@@ -348,20 +531,115 @@ npm run test:run -- src/features/profile/ChangePasswordModal.test.tsx  # Single 
 
 ## Important Files
 
-- `src/app/store.ts` - Redux store configuration
+### Core Configuration
+- `src/app/store.ts` - Redux store with DevTools, logging middleware
 - `src/app/authSlice.ts` - Authentication state management
-- `src/services/baseApi.ts` - RTK Query base API with global config
+- `src/services/baseApi.ts` - Type-safe RTK Query base API with CSRF, error handling
 - `src/routes/index.tsx` - Application routing structure
-- `src/types/` - TypeScript type definitions
 - `vite.config.ts` - Build config, path aliases, security headers, code splitting
+
+### Type Definitions
+- `src/types/errors.ts` - Error handling types (ErrorType, AppError, ApiError)
+- `src/types/api.ts` - API response types (ApiListResponse, PaginationParams)
+- `src/types/` - Other TypeScript type definitions
+
+### Utilities & Config
+- `src/hooks/` - Custom hooks (useAuth, usePagination, useApiMutation, etc.)
+- `src/config/features.ts` - Feature flags configuration
+- `src/utils/analytics.ts` - Event tracking system
+- `src/locales/i18n.ts` - i18next configuration (XSS-safe)
+
+### Components
+- `src/components/errors/ErrorAlert.tsx` - Error display with retry
+- `src/components/forms/` - Reusable form components (FormTextField, FormSelect)
+- `src/components/ui/` - UI components (SkeletonTable, SkeletonCard, etc.)
+
+### Documentation
+- `CLAUDE.md` - This file (project guidance)
+- `RECOMMENDATIONS.md` - 6-week implementation roadmap
+- `IMPROVEMENTS_SUMMARY.md` - Complete improvements documentation
+- `BEFORE_AFTER.md` - Side-by-side comparison of improvements
 
 ## Environment Variables
 
-Required in `.env`:
+Copy `.env.example` to `.env` and configure:
 ```
+# Backend API
 VITE_API_URL=http://localhost:5000/api  # Backend API base URL
-VITE_APP_NAME=React Shop
+VITE_APP_NAME=React Claude App          # Application name
+
+# Error Tracking
+VITE_SENTRY_DSN=                        # Sentry DSN (optional)
+VITE_SENTRY_ENABLED=false               # Enable/disable Sentry
+VITE_ENV=development                    # Environment
+
+# Development Tools
+VITE_ENABLE_MSW=false                   # Enable Mock Service Worker
+
+# Feature Flags (optional)
+VITE_FEATURE_DARK_MODE=true             # Dark mode toggle
+VITE_FEATURE_ANALYTICS=true             # Event tracking
+VITE_FEATURE_WEBSOCKETS=false           # WebSocket support
+VITE_FEATURE_NOTIFICATIONS=true         # Push notifications
+VITE_FEATURE_BETA=false                 # Beta features
+
+# Analytics (optional)
+VITE_GA_MEASUREMENT_ID=G-XXXXXXXXXX     # Google Analytics ID
 ```
+
+## Recent Architectural Improvements (2025)
+
+This project has been enhanced with modern, production-ready patterns:
+
+### ✅ Type Safety
+- Removed all `any` types from baseApi
+- Added proper error type hierarchy (ErrorType, AppError, ApiError)
+- Created API response type wrappers (ApiListResponse, PaginationParams)
+
+### ✅ Error Handling
+- Centralized error types with user-friendly categorization
+- `<ErrorAlert />` component with retry functionality
+- Enhanced `<ErrorBoundary />` with stack traces in dev mode
+- Toast notifications for all user actions
+
+### ✅ Custom Hooks
+- `useAuth` - Authentication utilities
+- `usePagination` - Client-side pagination
+- `useApiMutation` - Mutation with loading/error/toast
+- `useDebounce` - Debounced values for search
+- `useLocalStorage` - Persistent state
+- `useActivityTimeout` - Auto-logout after inactivity
+
+### ✅ API Enhancements
+- Pagination support (page, perPage, sortBy, sortOrder, search)
+- Optimistic updates for instant UI feedback
+- Smart cache invalidation (individual + list tags)
+- CSRF token support
+- Network error detection
+
+### ✅ UI/UX Improvements
+- Loading skeletons (SkeletonTable, SkeletonCard)
+- Toast notifications (success, error, warning)
+- Form components (FormTextField, FormSelect)
+- Enhanced MainLayout (logout, user display, activity timeout)
+
+### ✅ Security
+- XSS protection in i18n (`escapeValue: true`)
+- CSRF token support in baseApi
+- 30-minute activity timeout with auto-logout
+- Access tokens in memory only
+
+### ✅ Developer Experience
+- Redux DevTools with trace
+- Custom logging middleware (dev only)
+- Feature flags system
+- Analytics tracking utilities
+- Comprehensive documentation (3 markdown files)
+
+**For detailed explanations, see:**
+- `RECOMMENDATIONS.md` - Implementation roadmap
+- `IMPROVEMENTS_SUMMARY.md` - Complete documentation
+- `BEFORE_AFTER.md` - Side-by-side comparisons
 
 ## Testing Philosophy
 
